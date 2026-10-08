@@ -1,5 +1,7 @@
 # Penthouse Smash
 
+**Play: https://crunchy000.github.io/pixels/** (needs a WebGPU browser)
+
 A WebGPU micro-voxel playground: a Las Vegas penthouse suite built from
 **1.25 cm voxels** (≈ 400 million cells, 16 m × 4.4 m × 12 m), ray-marched on
 the GPU at roughly **one voxel per pixel**, where everything can be destroyed.
