@@ -92,8 +92,8 @@ async function main() {
   let autoRes = TARGET_FRAME_MS > 0 && !new URLSearchParams(location.search).has('scale');
   let reflections = !isTouch;
   let lightShadows = true;
-  let night = 0;
-  let nightTarget = 0;
+  let night = new URLSearchParams(location.search).has('night') ? 1 : 0;
+  let nightTarget = night;
 
   const resize = () => {
     canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
@@ -106,7 +106,7 @@ async function main() {
   let last = performance.now();
   let smoothedMs = 16;
   let fireCooldown = 0;
-  let hudTimer = 0;
+  let hudTimer = 0.25;
   let frames = 0;
   let fpsAccum = 0;
   let fps = 0;

@@ -5,57 +5,68 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>Penthouse Smash</title>
     <meta name="description" content="A WebGPU micro-voxel playground: smash up a Las Vegas penthouse at roughly one voxel per pixel." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Monoton&family=Barlow+Semi+Condensed:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" />
     <style>
+      /* One committed look: a casino marquee at night. HUD panels float over a full-bleed canvas. */
       :root {
         --bg: #07060a;
-        --panel: rgba(12, 10, 18, 0.62);
-        --panel-border: rgba(255, 255, 255, 0.1);
-        --text: #f4efe6;
-        --muted: #b8afc4;
+        --panel: rgba(14, 10, 20, 0.66);
+        --panel-border: rgba(255, 214, 240, 0.12);
+        --text: #f6efe4;
+        --muted: #b9adc6;
         --accent: #ff4fb3;
         --accent-2: #39e6ff;
         --gold: #f1c35a;
+        --shadow: #000000;
+        --font-display: 'Monoton', 'Impact', 'Arial Black', sans-serif;
+        --font-body: 'Barlow Semi Condensed', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+        --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        color-scheme: dark;
       }
       * { box-sizing: border-box; }
       html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); overflow: hidden; }
-      body { font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif; }
+      body { font: 14px/1.45 var(--font-body); }
+      button:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+      @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
       canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; image-rendering: auto; touch-action: none; }
       #overlay { position: fixed; inset: 0; pointer-events: none; }
       #overlay * { pointer-events: auto; }
       .panel { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
       #crosshair { position: absolute; left: 50%; top: 50%; width: 18px; height: 18px; transform: translate(-50%, -50%); pointer-events: none !important; }
-      #crosshair::before, #crosshair::after { content: ''; position: absolute; background: rgba(255,255,255,0.85); box-shadow: 0 0 2px #000; }
+      #crosshair::before, #crosshair::after { content: ''; position: absolute; background: var(--text); opacity: 0.85; box-shadow: 0 0 2px var(--shadow); }
       #crosshair::before { left: 8px; top: 0; width: 2px; height: 18px; }
       #crosshair::after { top: 8px; left: 0; height: 2px; width: 18px; }
       #hud-left { position: absolute; left: 16px; top: 16px; padding: 10px 12px; min-width: 210px; pointer-events: none !important; }
-      #hud-left h1 { margin: 0 0 4px; font-size: 15px; letter-spacing: 0.08em; text-transform: uppercase; }
+      #hud-left h1 { margin: 0 0 6px; font: 400 17px/1.1 var(--font-display); letter-spacing: 0.04em; }
       #hud-left h1 span { color: var(--accent); text-shadow: 0 0 8px var(--accent); }
-      #stats { color: var(--muted); font-variant-numeric: tabular-nums; white-space: pre; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+      #stats { color: var(--muted); font-variant-numeric: tabular-nums; white-space: pre; font-family: var(--font-mono); font-size: 11px; }
       #bill { position: absolute; right: 16px; top: 16px; padding: 10px 14px; text-align: right; pointer-events: none !important; }
-      #bill .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; }
-      #bill .amount { font-size: 22px; font-weight: 700; color: var(--gold); text-shadow: 0 0 10px rgba(241,195,90,0.5); font-variant-numeric: tabular-nums; }
+      #bill .label { color: var(--muted); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.14em; }
+      #bill .amount { font: 600 22px/1.2 var(--font-mono); color: var(--gold); text-shadow: 0 0 10px rgba(241,195,90,0.5); font-variant-numeric: tabular-nums; }
       #tools { position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%); display: flex; gap: 6px; padding: 6px; }
-      #tools button { all: unset; cursor: pointer; padding: 6px 10px; border-radius: 7px; color: var(--muted); font-weight: 600; font-size: 12px; }
-      #tools button kbd { font: inherit; opacity: 0.6; margin-right: 6px; }
+      #tools button { all: unset; cursor: pointer; padding: 6px 11px; border-radius: 7px; color: var(--muted); font: 600 13px/1.2 var(--font-body); letter-spacing: 0.04em; text-transform: uppercase; }
+      #tools button kbd { font: 400 11px var(--font-mono); opacity: 0.6; margin-right: 6px; }
       #tools button.active { background: rgba(255, 79, 179, 0.22); color: var(--text); box-shadow: inset 0 0 0 1px rgba(255,79,179,0.6); }
       #help { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(460px, calc(100vw - 32px)); padding: 18px 20px; max-height: calc(100vh - 32px); overflow: auto; }
-      #help h2 { margin: 0 0 4px; font-size: 20px; }
+      #help h2 { margin: 0 0 8px; font: 400 28px/1.1 var(--font-display); text-wrap: balance; }
       #help h2 span { color: var(--accent); text-shadow: 0 0 10px var(--accent); }
       #help p { color: var(--muted); margin: 0 0 12px; }
       #help table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
       #help td { padding: 3px 0; vertical-align: top; }
-      #help td:first-child { color: var(--accent-2); white-space: nowrap; padding-right: 14px; font-family: ui-monospace, Menlo, monospace; }
-      #help .go { margin-top: 14px; display: block; width: 100%; padding: 10px; border: 0; border-radius: 8px; background: linear-gradient(90deg, var(--accent), #b44dff); color: white; font-weight: 700; font-size: 14px; cursor: pointer; }
+      #help td:first-child { color: var(--accent-2); white-space: nowrap; padding-right: 14px; font-family: var(--font-mono); font-size: 11.5px; }
+      #help .go { margin-top: 14px; display: block; width: 100%; padding: 10px; border: 0; border-radius: 8px; background: var(--accent); color: var(--bg); font: 700 15px/1.2 var(--font-body); letter-spacing: 0.12em; text-transform: uppercase; cursor: pointer; box-shadow: 0 0 18px rgba(255,79,179,0.45); }
       #loading { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; background: var(--bg); }
       #loading .bar { width: min(320px, 70vw); height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden; }
       #loading .bar div { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.2s; }
       #loading .msg { color: var(--muted); }
-      #loading .title { font-size: 26px; font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; }
+      #loading .title { font: 400 clamp(26px, 7vw, 44px)/1.1 var(--font-display); text-align: center; }
       #loading .title span { color: var(--accent); text-shadow: 0 0 14px var(--accent); }
       #error { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(520px, calc(100vw - 32px)); padding: 18px 20px; display: none; white-space: pre-wrap; }
-      #error h2 { margin: 0 0 8px; color: var(--accent); }
+      #error h2 { margin: 0 0 8px; color: var(--accent); font: 700 20px/1.2 var(--font-body); }
       #touch { display: none; position: absolute; right: 16px; bottom: 70px; gap: 10px; flex-direction: column; align-items: flex-end; }
-      #touch button { all: unset; width: 64px; height: 64px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; color: var(--text); }
+      #touch button { all: unset; width: 64px; height: 64px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font: 700 13px var(--font-body); letter-spacing: 0.08em; color: var(--text); }
       #touch .fire { background: rgba(255, 79, 179, 0.4); box-shadow: inset 0 0 0 2px rgba(255,79,179,0.8); width: 78px; height: 78px; }
       #touch .small { background: var(--panel); border: 1px solid var(--panel-border); width: 52px; height: 52px; font-size: 11px; }
       body.is-touch #touch { display: flex; }
@@ -92,7 +103,7 @@
       </div>
       <div id="help" class="panel" style="display: none">
         <h2>Penthouse <span>Smash</span></h2>
-        <p>A Las Vegas suite built from tens of millions of centimetre voxels, ray-marched on the GPU at about one voxel per pixel. Everything is destructible. The bill is on you.</p>
+        <p>A Las Vegas suite built from 1.25&nbsp;cm voxels, ray-marched on the GPU at about one voxel per pixel. Every bottle, chip and crystal can be smashed, and the damage goes on your bill.</p>
         <table class="desktop-only">
           <tr><td>Mouse</td><td>Look (click to capture)</td></tr>
           <tr><td>WASD / Shift</td><td>Move / run</td></tr>
@@ -100,7 +111,7 @@
           <tr><td>Left click</td><td>Fire</td></tr>
           <tr><td>1-4 / wheel</td><td>Pistol, Shotgun, Blaster, Dynamite</td></tr>
           <tr><td>F</td><td>Toggle fly mode</td></tr>
-          <tr><td>N</td><td>Dusk / night</td></tr>
+          <tr><td>N</td><td>Dusk / night (or open with ?night=1)</td></tr>
           <tr><td>[ / ]</td><td>Render scale down / up (locks auto-res)</td></tr>
           <tr><td>P</td><td>Pixelated upscale</td></tr>
           <tr><td>R / L</td><td>Reflections / lamp shadows</td></tr>
@@ -111,7 +122,7 @@
           <tr><td>Right thumb</td><td>Look</td></tr>
           <tr><td>FIRE / TOOL</td><td>Shoot / switch weapon</td></tr>
         </table>
-        <button class="go" id="go">Check in</button>
+        <button class="go" id="go" type="button">Check in</button>
       </div>
       <div id="loading">
         <div class="title">Penthouse <span>Smash</span></div>

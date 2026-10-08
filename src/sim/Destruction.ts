@@ -1,7 +1,7 @@
-import { GRAVITY, VOXEL_SIZE } from '../config';
+import { BRICK_VOXELS, GRAVITY, VOXEL_SIZE } from '../config';
 import { Renderer } from '../render/Renderer';
 import { materials } from '../world/materials';
-import { VoxelWorld } from '../world/VoxelWorld';
+import { UNIFORM, VoxelWorld } from '../world/VoxelWorld';
 import { LightSystem } from './LightSystem';
 
 // Particle flags (must match particle_common.wgsl).
@@ -28,7 +28,7 @@ export const TOOLS: Tool[] = [
   { name: 'Pistol', key: '1', radius: 0.035, fragileRadius: 0.09, impulse: 2.5, rate: 7, pellets: 1, spread: 0, auto: true },
   { name: 'Shotgun', key: '2', radius: 0.045, fragileRadius: 0.1, impulse: 3.5, rate: 1.4, pellets: 10, spread: 0.055, auto: false },
   { name: 'Blaster', key: '3', radius: 0.3, fragileRadius: 0.45, impulse: 5, rate: 1.6, pellets: 1, spread: 0, auto: true },
-  { name: 'Dynamite', key: '4', radius: 0.75, fragileRadius: 1.0, impulse: 8, rate: 0.6, pellets: 1, spread: 0, auto: false },
+  { name: 'Dynamite', key: '4', radius: 0.7, fragileRadius: 0.85, impulse: 8, rate: 0.6, pellets: 1, spread: 0, auto: false },
 ];
 
 interface Chunk {
@@ -133,40 +133,82 @@ export class Destruction {
     if (FRAGILE[id] !== 0 || tool.fragileRadius > tool.radius) {
       this.carve(cx, cy, cz, tool.fragileRadius / VOXEL_SIZE, true, removed);
     }
-    this.carve(cx, cy, cz, r, false, removed);
+    const kept = this.carve(cx, cy, cz, r, false, removed);
     if (removed.length === 0) return;
     this.spawnDebris(removed, cx, cy, cz, n, dir, tool.impulse / VOXEL_SIZE);
     this.lights.flash([cx * VOXEL_SIZE + n[0] * 0.05, cy * VOXEL_SIZE + n[1] * 0.05, cz * VOXEL_SIZE + n[2] * 0.05], tool.radius);
-    this.detachIslands(removed);
+    this.detachIslands(removed, { cx, cy, cz, r: kept - 1.01 });
   }
 
-  /** Remove voxels inside a jittered sphere. fragileOnly limits to breakable materials. */
-  private carve(cx: number, cy: number, cz: number, r: number, fragileOnly: boolean, out: number[]) {
+  /**
+   * Remove voxels inside a jittered sphere. fragileOnly limits to breakable materials.
+   * Returns the distance from the centre to the nearest surviving solid voxel
+   * (capped at the search radius): removed voxels deeper than that can't border
+   * anything, which lets island detection skip them.
+   */
+  private carve(cx: number, cy: number, cz: number, r: number, fragileOnly: boolean, out: number[]): number {
     const w = this.world;
     const R = Math.ceil(r * 1.2);
-    const x0 = Math.floor(cx - R), x1 = Math.ceil(cx + R);
-    const y0 = Math.floor(cy - R), y1 = Math.ceil(cy + R);
-    const z0 = Math.floor(cz - R), z1 = Math.ceil(cz + R);
-    for (let z = z0; z <= z1; z++)
-      for (let y = y0; y <= y1; y++)
-        for (let x = x0; x <= x1; x++) {
-          const dx = x + 0.5 - cx, dy = y + 0.5 - cy, dz = z + 0.5 - cz;
-          const d2 = dx * dx + dy * dy + dz * dz;
-          if (d2 > R * R) continue;
-          const v = w.get(x, y, z);
-          if (v === 0) continue;
-          const id = v & 0xff;
-          if (fragileOnly && FRAGILE[id] === 0) continue;
-          const soft = fragileOnly ? 1 : SOFT[id];
-          if (soft <= 0) continue;
-          const jitter = 0.8 + 0.4 * hash3(x, y, z);
-          // Hard materials shrink the hole, but a hit always punches through ~5 voxels
-          // so rods, chains and table legs can be shot through.
-          const rr = Math.max(r * Math.min(1.4, soft), Math.min(r, 2.5)) * jitter;
-          if (d2 > rr * rr) continue;
-          w.set(x, y, z, 0);
-          out.push(x, y, z, v);
+    const x0 = Math.max(0, Math.floor(cx - R)), x1 = Math.min(w.dx - 1, Math.ceil(cx + R));
+    const y0 = Math.max(0, Math.floor(cy - R)), y1 = Math.min(w.dy - 1, Math.ceil(cy + R));
+    const z0 = Math.max(0, Math.floor(cz - R)), z1 = Math.min(w.dz - 1, Math.ceil(cz + R));
+    let minKept2 = R * R;
+    // Walk bricks first so empty space (most of a blast) costs one lookup per 512 voxels,
+    // then edit the brick's voxels in place.
+    for (let bz = z0 >> 3; bz <= z1 >> 3; bz++)
+      for (let by = y0 >> 3; by <= y1 >> 3; by++)
+        for (let bx = x0 >> 3; bx <= x1 >> 3; bx++) {
+          const ci = w.cellIndex(bx, by, bz);
+          const g = w.grid[ci];
+          if (g === 0) continue;
+          const ex = Math.max(bx * 8 - cx, 0, cx - bx * 8 - 8);
+          const ey = Math.max(by * 8 - cy, 0, cy - by * 8 - 8);
+          const ez = Math.max(bz * 8 - cz, 0, cz - bz * 8 - 8);
+          const near2 = ex * ex + ey * ey + ez * ez;
+          if (near2 > R * R) continue;
+          const uni = (g & UNIFORM) !== 0;
+          if (uni) {
+            // One material: skip the brick if even its largest jittered radius can't reach it.
+            const id = g & 0xff;
+            const soft = fragileOnly ? (FRAGILE[id] ? 1 : 0) : SOFT[id];
+            const reach = soft <= 0 ? -1 : Math.max(r * Math.min(1.4, soft), Math.min(r, 2.5)) * 1.2;
+            if (near2 > reach * reach) {
+              minKept2 = Math.min(minKept2, near2);
+              continue;
+            }
+          }
+          let base = uni ? -1 : (g - 1) * BRICK_VOXELS;
+          let edited = false;
+          const vx1 = Math.min(x1, bx * 8 + 7), vy1 = Math.min(y1, by * 8 + 7), vz1 = Math.min(z1, bz * 8 + 7);
+          for (let z = Math.max(z0, bz * 8); z <= vz1; z++)
+            for (let y = Math.max(y0, by * 8); y <= vy1; y++)
+              for (let x = Math.max(x0, bx * 8); x <= vx1; x++) {
+                const dx = x + 0.5 - cx, dy = y + 0.5 - cy, dz = z + 0.5 - cz;
+                const d2 = dx * dx + dy * dy + dz * dz;
+                if (d2 > R * R) continue;
+                const li = (x & 7) | ((y & 7) << 3) | ((z & 7) << 6);
+                const v = base < 0 ? g & 0xffff : w.pool[base + li];
+                if (v === 0) continue;
+                const id = v & 0xff;
+                const soft = fragileOnly ? (FRAGILE[id] ? 1 : 0) : SOFT[id];
+                // Hard materials shrink the hole, but a hit always punches through ~5 voxels
+                // so rods, chains and table legs can be shot through.
+                const rr = soft <= 0 ? -1 : Math.max(r * Math.min(1.4, soft), Math.min(r, 2.5)) * (0.8 + 0.4 * hash3(x, y, z));
+                if (d2 > rr * rr) {
+                  if (d2 < minKept2) minKept2 = d2;
+                  continue;
+                }
+                if (base < 0) base = w.editableBrick(ci) * BRICK_VOXELS;
+                w.pool[base + li] = 0;
+                edited = true;
+                out.push(x, y, z, v);
+              }
+          if (edited) {
+            w.dirtyBricks.add(base / BRICK_VOXELS);
+            w.dirtyCells.add(ci);
+          }
         }
+    return Math.sqrt(minKept2);
   }
 
   /** Remove the 6-connected component of material `id` containing (x,y,z). */
@@ -226,13 +268,18 @@ export class Destruction {
    * After removing voxels, find solid neighbours whose connected component no
    * longer touches anything structural, and turn those into falling chunks.
    */
-  private detachIslands(removed: number[]) {
+  private detachIslands(removed: number[], core?: { cx: number; cy: number; cz: number; r: number }) {
     const w = this.world;
     const key = (a: number, b: number, c: number) => a + w.dx * (b + w.dy * c);
     const seeds: number[] = [];
     const seedSet = new Set<number>();
+    const core2 = core && core.r > 0 ? core.r * core.r : -1;
     for (let i = 0; i < removed.length; i += 4) {
       const x = removed[i], y = removed[i + 1], z = removed[i + 2];
+      if (core2 > 0) {
+        const dx = x + 0.5 - core!.cx, dy = y + 0.5 - core!.cy, dz = z + 0.5 - core!.cz;
+        if (dx * dx + dy * dy + dz * dz < core2) continue; // all neighbours are air
+      }
       for (let k = 0; k < 6; k++) {
         const nx = x + (k === 0 ? 1 : k === 1 ? -1 : 0);
         const ny = y + (k === 2 ? 1 : k === 3 ? -1 : 0);

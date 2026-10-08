@@ -2,7 +2,7 @@
 // into the voxel world. Coordinates are metres: x = east, y = up, z = north.
 // The north and east walls are floor-to-ceiling glass looking out over the Strip.
 
-import { VOXEL_SIZE as VS } from '../config';
+import { BRICK, VOXELS_PER_METER, VOXEL_SIZE as VS } from '../config';
 import { M, vox } from '../world/materials';
 import {
   Builder,
@@ -42,9 +42,13 @@ export interface Scene {
   spawn: { pos: Vec3; yaw: number; pitch: number };
 }
 
-const FLOOR = 0.2;
-const CEIL = 4.1;
-const WALL = 0.25;
+// Big architectural planes sit on brick boundaries, so floor, ceiling and wall
+// slabs compress to uniform bricks at any voxel density.
+const snap = (m: number) => (Math.round((m * VOXELS_PER_METER) / BRICK) * BRICK) / VOXELS_PER_METER;
+const BRICK_M = BRICK / VOXELS_PER_METER;
+const FLOOR = snap(0.2);
+const CEIL = snap(4.1);
+const WALL = snap(0.25);
 const RW = 16; // room width (x)
 const RD = 12; // room depth (z)
 
@@ -182,10 +186,10 @@ function shell(B: Builder) {
   // West + south walls: concrete core, plaster skin.
   B.add(boxMinMax(0, FLOOR, 0, WALL, CEIL, RD), vox(M.concrete));
   B.add(boxMinMax(0, FLOOR, 0, RW, CEIL, WALL), vox(M.concrete));
-  B.add(boxMinMax(WALL - 0.03, FLOOR, WALL, WALL, CEIL, RD), vox(M.wall));
-  B.add(boxMinMax(WALL, FLOOR, WALL - 0.03, RW, CEIL, WALL), vox(M.wall));
+  B.add(boxMinMax(WALL - BRICK_M, FLOOR, WALL, WALL, CEIL, RD), vox(M.wall));
+  B.add(boxMinMax(WALL, FLOOR, WALL - BRICK_M, RW, CEIL, WALL), vox(M.wall));
   // Dark accent wall behind the bar.
-  B.add(boxMinMax(WALL - 0.03, FLOOR, 2.1, WALL, CEIL, 7.9), vox(M.wallDark));
+  B.add(boxMinMax(WALL - BRICK_M, FLOOR, snap(2.1), WALL, CEIL, snap(7.9)), vox(M.wallDark));
   // Baseboards.
   B.add(boxMinMax(WALL, FLOOR, WALL, WALL + 0.02, FLOOR + 0.12, RD - WALL), vox(M.marbleBlack));
   B.add(boxMinMax(WALL, FLOOR, WALL, RW - WALL, FLOOR + 0.12, WALL + 0.02), vox(M.marbleBlack));
