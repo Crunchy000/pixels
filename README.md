@@ -138,14 +138,19 @@ tables all live in one GPU "heap" buffer (`src/gpu/layout.ts`).
    slots double as nodes of a lock-free union-find. Components that touch
    anything structural (floor, walls, ceiling, window frames) are anchored and
    stop expanding; the rest are lifted out of the world as **falling chunks**
-   (crumbs under 48 voxels just become debris).
+   (crumbs under 48 voxels just become debris). The search walks straight down
+   a column first, so anything standing on the floor anchors in one step, and
+   components bigger than 400k voxels are assumed to be supported.
 5. **Falling chunks** are drawn as voxel cubes while they fall, so they can't
    collide with themselves. On landing they smash fragile things underneath
    (chandelier into glass table), shatter if they are fragile themselves, and
    otherwise write their voxels back into the world.
 6. **Debris** particles: gravity, drag, voxel-DDA collision and bounce. When
    they come to rest many are written straight back into the world as voxels,
-   so rubble piles up and can be shot again.
+   so rubble piles up and can be shot again. Settled debris uses a "rubble"
+   twin of its material (ids 128–255): it looks the same but carries no load,
+   so shards piled on a bracket can't hold up a shelf, and it tumbles again
+   when whatever it rests on is destroyed.
 7. **Player**: walking with voxel collision (or flying) runs in a one-thread
    compute pass that also builds the camera matrices.
 

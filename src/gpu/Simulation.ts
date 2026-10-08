@@ -2,6 +2,7 @@ import { MAX_PARTICLES } from '../config';
 import playerWGSL from '../render/shaders/player.wgsl?raw';
 import sharedWGSL from '../render/shaders/shared.wgsl?raw';
 import simWGSL from '../render/shaders/sim.wgsl?raw';
+import probeWGSL from '../render/shaders/probe.wgsl?raw';
 import { GpuWorld } from './GpuWorld';
 import { ARGS, ARGS_WORDS, CTRL, CTRL_WORDS, LIMITS, layoutWGSL } from './layout';
 
@@ -31,6 +32,8 @@ export interface SimStats {
   searches: number;
   islands: number;
   searching: boolean;
+  /** Island-search internals (debugging). */
+  search: { nodes: number; iters: number; pending: number; frontier: number; seedDrops: number; budgetHits: number; hashFull: number };
   flying: boolean;
   eye: [number, number, number];
 }
@@ -64,7 +67,7 @@ export class Simulation {
   private playerGroup!: GPUBindGroup;
   private readback: GPUBuffer;
   private readbackPending = false;
-  stats: SimStats = { bill: 0, destroyed: 0, falling: 0, particles: 0, liveBricks: 0, allocFailures: 0, searches: 0, islands: 0, searching: false, flying: false, eye: [0, 0, 0] };
+  stats: SimStats = { bill: 0, destroyed: 0, falling: 0, particles: 0, liveBricks: 0, allocFailures: 0, searches: 0, islands: 0, searching: false, search: { nodes: 0, iters: 0, pending: 0, frontier: 0, seedDrops: 0, budgetHits: 0, hashFull: 0 }, flying: false, eye: [0, 0, 0] };
   /** Called with each stats sample (bill and destroyed are deltas). */
   onStats: ((s: SimStats) => void) | null = null;
 
@@ -150,6 +153,48 @@ export class Simulation {
       ],
     });
   }
+
+  /**
+   * Debug/test helper: read back the voxel values in a box (voxel coords).
+   * Never used by the game itself, which keeps all voxel data on the GPU.
+   */
+  async probe(origin: [number, number, number], size: [number, number, number]): Promise<Uint32Array> {
+    const gw = this.gw;
+    const d = gw.device;
+    if (!this.probePipe) {
+      const mod = await compileModule(d, 'probe', sharedWGSL + probeWGSL);
+      this.probePipe = await d.createComputePipelineAsync({ layout: 'auto', compute: { module: mod, entryPoint: 'probe' } });
+    }
+    const n = size[0] * size[1] * size[2];
+    const params = d.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    d.queue.writeBuffer(params, 0, new Int32Array([...origin, 0, ...size, 0]));
+    const out = d.createBuffer({ size: n * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const rb = d.createBuffer({ size: n * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    const group = d.createBindGroup({
+      layout: this.probePipe.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: gw.uniformBuf } },
+        { binding: 1, resource: { buffer: gw.gridBuf } },
+        { binding: 2, resource: { buffer: gw.poolBuf } },
+        { binding: 4, resource: { buffer: params } },
+        { binding: 5, resource: { buffer: out } },
+      ],
+    });
+    const enc = d.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.probePipe);
+    pass.setBindGroup(0, group);
+    pass.dispatchWorkgroups(Math.ceil(n / 64));
+    pass.end();
+    enc.copyBufferToBuffer(out, 0, rb, 0, n * 4);
+    d.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const vals = new Uint32Array(rb.getMappedRange().slice(0));
+    rb.unmap();
+    [params, out, rb].forEach((b) => b.destroy());
+    return vals;
+  }
+  private probePipe: GPUComputePipeline | null = null;
 
   /** Record one simulation step. The uniform block must already hold this frame's input. */
   encode(enc: GPUCommandEncoder): void {
@@ -261,6 +306,10 @@ export class Simulation {
           searches: u[CTRL.S_SEARCHES],
           islands: u[CTRL.S_ISLANDS],
           searching: u[CTRL.C_S_STATE] !== 0,
+          search: {
+            nodes: u[CTRL.C_NODES], iters: u[CTRL.C_S_ITERS], pending: u[CTRL.C_PENDING], frontier: u[CTRL.C_S_CUR],
+            seedDrops: u[CTRL.S_SEED_DROP], budgetHits: u[CTRL.S_BUDGET], hashFull: u[CTRL.S_HASH_FULL],
+          },
           flying: f[cam + 35] > 0.5,
           eye: [f[cam + 32], f[cam + 33], f[cam + 34]],
         };

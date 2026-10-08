@@ -60,6 +60,9 @@ fn superOf(ci: u32) -> u32 {
 fn localIndex(p: vec3i) -> u32 { return u32((p.x & 7) | ((p.y & 7) << 3u) | ((p.z & 7) << 6u)); }
 
 fn structural(v: u32) -> bool { return matE(v & 0xffu).z > 0.5; }
+/** Material ids 128..255 are rubble: settled debris that carries no load. */
+fn isRubble(v: u32) -> bool { return (v & 0x80u) != 0u; }
+fn rubbleOf(v: u32) -> u32 { return v | 0x80u; }
 fn fragile(v: u32) -> bool { return matE(v & 0xffu).y > 0.5; }
 fn priceDimes(v: u32) -> u32 { return u32(matD(v & 0xffu).w * 10.0 + 0.5); }
 fn rnd3(seed: u32) -> vec3f { return vec3f(rnd(seed), rnd(seed + 1u), rnd(seed + 2u)); }
@@ -177,7 +180,7 @@ fn debrisFlags(v: u32, seed: u32) -> u32 {
 /** Queue a voxel for the island search (it may have lost its support). */
 fn pushSeed(p: vec3i) {
   let k = atomicAdd(&ctrl[C_PENDING], 1u);
-  if (k < MAX_SEEDS) { hs(H_SEEDS + k, keyOf(p)); }
+  if (k < MAX_SEEDS) { hs(H_SEEDS + k, keyOf(p)); } else { atomicAdd(&ctrl[S_SEED_DROP], 1u); }
 }
 
 fn pushWrite(p: vec3i, v: u32) -> bool {
@@ -256,6 +259,7 @@ fn pushFlood(p: vec3i, mat: u32) {
 
 /** Bill + debris for one voxel broken off a glass pane. */
 fn shardEffects(p: vec3i, v: u32) {
+  dropRubbleAbove(p);
   atomicAdd(&ctrl[S_BILL], priceDimes(v));
   atomicAdd(&ctrl[S_DESTROYED], 1u);
   let seed = keyOf(p) ^ frameSeed();
@@ -263,6 +267,19 @@ fn shardEffects(p: vec3i, v: u32) {
     let s = 1.0 / VS();
     let vel = vec3f(rnd(seed + 3u) - 0.5, rnd(seed + 4u) * 0.4, rnd(seed + 5u) - 0.5) * vec3f(1.6, 1.0, 1.6) * s;
     spawn(vec3f(p) + 0.5, vel, v | debrisFlags(v, seed), 4.0 + 4.0 * rnd(seed + 6u));
+  }
+}
+
+/** Rubble resting on a voxel that just went away tumbles down as debris again. */
+fn dropRubbleAbove(p: vec3i) {
+  for (var d = 1; d <= 12; d++) {
+    let q = p + vec3i(0, d, 0);
+    let v = readVoxel(q);
+    if (v == 0u || !isRubble(v)) { return; }
+    let t = takeVoxel(q, v & 0xffu);
+    if (t == 0u) { return; }
+    let seed = keyOf(q) ^ frameSeed();
+    spawn(vec3f(q) + 0.5, (rnd3(seed) - 0.5) * vec3f(0.4, 0.0, 0.4) / VS(), t | DEPOSIT, 6.0 + 2.0 * rnd(seed + 5u));
   }
 }
 
@@ -477,6 +494,7 @@ var<workgroup> wgAny: atomic<u32>;
 
 fn carveEffects(im: Impact, p: vec3i, v: u32, keep: f32) {
   let id = v & 0xffu;
+  dropRubbleAbove(p);
   atomicAdd(&wgDimes, priceDimes(v));
   atomicAdd(&wgCount, 1u);
   let seed = keyOf(p) ^ frameSeed();
@@ -503,7 +521,7 @@ fn carveEffects(im: Impact, p: vec3i, v: u32, keep: f32) {
       }
       continue;
     }
-    if (!structural(w) && !removes(im, q, w)) { pushSeed(q); }
+    if (!structural(w) && !isRubble(w) && !removes(im, q, w)) { pushSeed(q); }
   }
 }
 
@@ -594,7 +612,7 @@ fn floodStep(@builtin(global_invocation_id) gid: vec3u) {
       pushFlood(nb, mat);
     } else {
       let w = readVoxel(nb);
-      if (w != 0u && (w & 0xffu) != mat && !structural(w)) { pushSeed(nb); }
+      if (w != 0u && (w & 0xffu) != mat && !structural(w) && !isRubble(w)) { pushSeed(nb); }
     }
   }
 }
@@ -658,6 +676,7 @@ fn unite(x: u32, y: u32) {
     let old = atomicMin(&heap[H_PARENT + a], b);
     if (old == a) {
       if ((h(H_NFLAGS + a) & 2u) != 0u) { atomicOr(&heap[H_NFLAGS + b], 2u); }
+      atomicAdd(&heap[H_NCOUNT + b], h(H_NCOUNT + a)); // approximate running size
       return;
     }
     a = findRoot(old);
@@ -707,6 +726,7 @@ fn searchClear(@builtin(global_invocation_id) gid: vec3u) {
   hs(H_PARENT + i, i);
   hs(H_NFLAGS + i, 0u);
   hs(H_NSIZE + i, 0u);
+  hs(H_NCOUNT + i, 0u);
 }
 
 @compute @workgroup_size(64)
@@ -714,9 +734,12 @@ fn searchSeed(@builtin(global_invocation_id) gid: vec3u) {
   if (gid.x >= cget(C_SEED_N)) { return; }
   let p = posOf(h(H_SEEDS + gid.x));
   let v = readVoxel(p);
-  if (v == 0u || structural(v)) { return; }
+  if (v == 0u || structural(v) || isRubble(v)) { return; }
   let ins = hashInsert(keyOf(p));
-  if (ins.y == 1u) { pushSearch(ins.x); }
+  if (ins.y == 1u) {
+    atomicAdd(&heap[H_NCOUNT + ins.x], 1u);
+    pushSearch(ins.x);
+  }
 }
 
 @compute @workgroup_size(1)
@@ -740,34 +763,66 @@ fn searchArgs() {
   setArgs(A_SEARCH, groups(n));
 }
 
+/** Visit q from node s: returns the node for q (NONE if q is air or anchors s). */
+fn visit(s: u32, q: vec3i) -> vec2u {
+  if (!inWorld(q)) { return vec2u(NONE, 0u); }
+  let w = readVoxel(q);
+  // Rubble neither holds things up nor gets carried along (it drops separately).
+  if (w == 0u || isRubble(w)) { return vec2u(NONE, 0u); }
+  if (structural(w)) {
+    anchorNode(s);
+    return vec2u(NONE, 0u);
+  }
+  let ins = hashInsert(keyOf(q));
+  if (ins.x == NONE) {
+    atomicAdd(&ctrl[S_HASH_FULL], 1u);
+    anchorNode(s); // table full: assume supported
+    return ins;
+  }
+  unite(s, ins.x);
+  if (ins.y == 1u) { atomicAdd(&heap[H_NCOUNT + findRoot(ins.x)], 1u); }
+  return ins;
+}
+
 @compute @workgroup_size(64)
 fn searchStep(@builtin(global_invocation_id) gid: vec3u) {
   if (gid.x >= cget(C_S_CUR)) { return; }
   let par = cget(C_S_PAR);
   let s = h(H_SEARCH_Q + par * HASH_SIZE + gid.x);
   // Component already known to be anchored: no need to explore it further.
-  if ((h(H_NFLAGS + findRoot(s)) & 2u) != 0u) { return; }
+  let r = findRoot(s);
+  if ((h(H_NFLAGS + r) & 2u) != 0u) { return; }
+  // Huge components (the sofa, the bar cabinet) are assumed to be supported.
+  if (h(H_NCOUNT + r) > COMPONENT_BUDGET) {
+    atomicAdd(&ctrl[S_BUDGET], 1u);
+    anchorNode(s);
+    return;
+  }
   let p = posOf(h(H_HASH_KEYS + s) - 1u);
   if (p.y == 0) {
     anchorNode(s);
     return;
   }
+  // Down first: walk straight down the column. Anything standing on the floor
+  // (or on furniture that stands on it) anchors in a single step, so big
+  // supported objects never get flooded voxel by voxel.
+  var prev = s;
+  for (var d = 1; d <= 96; d++) {
+    let q = p - vec3i(0, d, 0);
+    if (q.y < 0) {
+      anchorNode(prev);
+      break;
+    }
+    let ins = visit(prev, q);
+    if (ins.x == NONE || ins.y == 0u) { break; }
+    pushSearch(ins.x); // its sideways neighbours still need exploring (pruned if anchored)
+    prev = ins.x;
+  }
+  if ((h(H_NFLAGS + findRoot(s)) & 2u) != 0u) { return; }
   for (var k = 0; k < 6; k++) {
-    let q = p + dirOf(k);
-    if (!inWorld(q)) { continue; }
-    let w = readVoxel(q);
-    if (w == 0u) { continue; }
-    if (structural(w)) {
-      anchorNode(s);
-      continue;
-    }
-    let ins = hashInsert(keyOf(q));
-    if (ins.x == NONE) {
-      anchorNode(s); // table full: assume supported
-      continue;
-    }
-    if (ins.y == 1u) { pushSearch(ins.x); }
-    unite(s, ins.x);
+    if (k == 3) { continue; } // -y handled by the column walk
+    let ins = visit(s, p + dirOf(k));
+    if (ins.x != NONE && ins.y == 1u) { pushSearch(ins.x); }
   }
 }
 
@@ -846,6 +901,7 @@ fn resolveExtract(@builtin(global_invocation_id) gid: vec3u) {
   let p = posOf(h(H_HASH_KEYS + s) - 1u);
   let v = takeVoxel(p, ANY_MAT);
   if (v == 0u) { return; }
+  dropRubbleAbove(p);
   let cid = (f >> 8u) & 0x1ffu;
   if (cid > 0u && (f & 8u) == 0u) {
     let k = atomicAdd(&ctrl[C_ARENA], 1u);
@@ -902,8 +958,14 @@ fn chunkArgs() {
   var activeCount = 0u;
   for (var c = 0u; c < n; c++) {
     let b = chunkBase(c);
-    let st = h(b);
+    var st = h(b);
     if (st == 2u) { hs(b, 0u); }
+    // A chunk whose voxels were destroyed before it could be lifted out (or
+    // that fell out of the world) is retired so the arena can be recycled.
+    if (st == 1u && (h(b + 5u) == 0u || h(b + 2u) > dimsU().y)) {
+      hs(b, 0u);
+      st = 0u;
+    }
     if (st == 1u) { activeCount++; }
   }
   if (activeCount == 0u) {
@@ -1099,7 +1161,7 @@ fn particleSim(@builtin(global_invocation_id) gid: vec3u) {
     p.pos = vec3f(c) + 0.5;
     p.vel = vec3f(0.0);
     p.value |= SETTLED;
-    if ((p.value & DEPOSIT) != 0u && inWorld(c) && pushWrite(c, p.value & 0xffffu)) {
+    if ((p.value & DEPOSIT) != 0u && inWorld(c) && pushWrite(c, rubbleOf(p.value & 0xffffu))) {
       p.life = min(p.life, 0.5);
     } else {
       p.life = min(p.life, select(4.0, 0.8, dust));

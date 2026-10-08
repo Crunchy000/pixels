@@ -24,6 +24,8 @@ export const LIMITS = {
   maxFlashes: 8,
   /** Particles spawned per frame at most (keeps big blasts affordable). */
   spawnBudget: 60000,
+  /** A component bigger than this (voxels) is assumed to be supported. */
+  componentBudget: 400000,
   /** Island-search BFS iterations per frame. */
   searchItersPerFrame: 16,
   /** Pane-shatter flood iterations per frame (glass cracks spread across a few frames). */
@@ -51,6 +53,8 @@ const CTRL_NAMES = [
   ['C_DIRTY', 1], ['C_PCURSOR', 1], ['C_FLASH', 1], ['C_SPAWNED', 1],
   // Stats (read back for the HUD; S_BILL and S_DESTROYED are cleared after each read).
   ['S_BILL', 1], ['S_DESTROYED', 1], ['S_ALLOC_FAIL', 1], ['S_FALLING', 1], ['S_SEARCHES', 1], ['S_ISLANDS', 1],
+  // Debug counters: island-search shortcuts that assume support.
+  ['S_SEED_DROP', 1], ['S_BUDGET', 1], ['S_HASH_FULL', 1],
 ] as const;
 
 function indexTable<T extends readonly (readonly [string, number])[]>(names: T): { table: Record<T[number][0], number>; words: number } {
@@ -93,6 +97,7 @@ export function heapLayout(numCells: number, poolCapacity: number, maxParticles:
     ['PARENT', L.hashSize],
     ['NFLAGS', L.hashSize],
     ['NSIZE', L.hashSize],
+    ['NCOUNT', L.hashSize],
     ['NODE_LIST', L.hashSize],
     ['SEARCH_Q', 2 * L.hashSize],
     ['CHUNKS', L.maxChunks * 16],
@@ -135,6 +140,7 @@ export function layoutWGSL(heap: HeapLayout, extra: Record<string, number>): str
     MAX_ANCHORS: LIMITS.maxAnchors,
     MAX_FLASHES: LIMITS.maxFlashes,
     SPAWN_BUDGET: LIMITS.spawnBudget,
+    COMPONENT_BUDGET: LIMITS.componentBudget,
     ...extra,
   };
   for (const [k, v] of Object.entries(lim)) lines.push(`const ${k}: u32 = ${v >>> 0}u;`);

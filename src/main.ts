@@ -290,6 +290,8 @@ async function main() {
       requestTeleport([eye[0], eye[1] - EYE_HEIGHT, eye[2]], Math.atan2(dx, -dz), Math.atan2(dy, Math.hypot(dx, dz)));
     },
     toggleFly: () => { flyCounter++; },
+    /** Debug: read back voxel values in a box (voxel coords). */
+    probe: (o: [number, number, number], sz: [number, number, number]) => sim.probe(o, sz),
   };
 }
 

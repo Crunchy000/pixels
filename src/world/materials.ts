@@ -55,12 +55,20 @@ export interface Material extends Required<Omit<MaterialDef, 'color2'>> {
   color2: number;
 }
 
+/**
+ * Settled debris is written back as the material's rubble twin (id | RUBBLE):
+ * it looks the same, but never holds anything up (the GPU island search
+ * ignores it) and costs nothing to destroy again.
+ */
+export const RUBBLE = 128;
+
 export const materials: Material[] = [];
 const byName = new Map<string, number>();
 
 function define(name: string, def: MaterialDef): number {
   const id = materials.length + 1;
-  if (id > 255) throw new Error('too many materials');
+  // Ids 128..255 are reserved for the "rubble" twin of each material (see packMaterials).
+  if (id >= RUBBLE) throw new Error('too many materials');
   const m: Material = {
     id,
     name,
@@ -199,6 +207,12 @@ export function packMaterials(): Float32Array<ArrayBuffer> {
     out.set([a[0], a[1], a[2], m.emission, b[0], b[1], b[2], m.pattern], o);
     out.set([m.scale, m.noise, m.spec, m.shininess, m.reflect, m.glass, m.liquid ? 1 : 0, m.price], o + 8);
     out.set([m.softness, fragile, m.structural ? 1 : 0, m.debris], o + 16);
+    // Rubble twin: same look, not structural, already paid for.
+    const r = (m.id | RUBBLE) * MAT_FLOATS;
+    out.set(out.subarray(o, o + MAT_FLOATS), r);
+    out[r + 15] = 0; // price
+    out[r + 17] = Math.min(fragile, 1); // loose shards don't crack like a pane
+    out[r + 18] = 0; // structural
   }
   return out;
 }
