@@ -34,7 +34,7 @@ export const INITIAL_RENDER_SCALE = num('scale', 1, 0.2, 2);
 /** Dynamic resolution keeps the frame time near this target (ms). 0 disables it. */
 export const TARGET_FRAME_MS = num('target', 1000 / 50, 0, 100);
 
-export const MAX_PARTICLES = Math.round(num('particles', 1 << 18, 1 << 12, 1 << 21));
-export const MAX_LIGHTS = 32;
+/** Debris particle capacity (a power of two: the GPU ring buffer wraps with a mask). */
+export const MAX_PARTICLES = 2 ** Math.round(Math.log2(num('particles', 1 << 18, 1 << 12, 1 << 21)));
 
 export const GRAVITY = 9.81; // m/s^2

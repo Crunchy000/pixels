@@ -334,10 +334,10 @@ fn shade(h: Hit, ro: vec3f, rd: vec3f, quality: i32) -> vec3f {
     specular += sc * pow(max(dot(N, H), 0.0), C.w) * C.z;
   }
 
-  let count = i32(U.sunColor.w);
+  let count = lightCount();
   for (var i = 0; i < count; i++) {
-    let lp = lights[i * 2];
-    let lc = lights[i * 2 + 1];
+    let lp = lightPos(i);
+    let lc = lightCol(i);
     let Lp = lp.xyz / vs;
     let radius = lp.w / vs;
     var L = Lp - P;
@@ -389,9 +389,9 @@ fn fsMain(in: VSOut) -> FSOut {
   var out: FSOut;
   let uv = in.pos.xy * U.resolution.zw;
   let ndc = vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-  let far = U.invViewProj * vec4f(ndc, 1.0, 1.0);
+  let far = C.invViewProj * vec4f(ndc, 1.0, 1.0);
   let farW = far.xyz / far.w;
-  let camW = U.camPos.xyz;
+  let camW = C.eye.xyz;
   let rd = normalize(farW - camW);
   let ro = camW / U.dims.w;
 
@@ -442,7 +442,7 @@ fn fsMain(in: VSOut) -> FSOut {
     }
     color = h.trans * base + h.glow;
     let wp = (ro + rd * h.t) * U.dims.w;
-    let clip = U.viewProj * vec4f(wp, 1.0);
+    let clip = C.viewProj * vec4f(wp, 1.0);
     out.depth = clamp(clip.z / clip.w, 0.0, 1.0);
   }
   out.color = vec4f(color, 1.0);

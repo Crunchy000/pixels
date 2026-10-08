@@ -1,8 +1,9 @@
-// Debris rendering: one instanced cube per live particle (via the compacted
-// alive list + indirect draw), depth-tested against the ray-marched scene.
+// Debris + falling chunks: one instanced cube per live particle (compacted
+// alive list) or per voxel of a falling chunk (chunk arena), both drawn with
+// indirect args the simulation writes. Depth-tested against the ray-marched scene.
 
 @group(1) @binding(0) var<storage, read> partsR: array<Particle>;
-@group(1) @binding(1) var<storage, read> aliveR: array<u32>;
+@group(1) @binding(1) var<storage, read> heapR: array<u32>;
 
 struct PVOut {
   @builtin(position) pos: vec4f,
@@ -19,11 +20,8 @@ fn rotAxis(v: vec3f, axis: vec3f, ang: f32) -> vec3f {
   return v * c + cross(axis, v) * s + axis * dot(axis, v) * (1.0 - c);
 }
 
-@vertex
-fn vsParticle(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> PVOut {
-  var out: PVOut;
-  let idx = aliveR[ii];
-  let p = partsR[idx];
+/** Unit cube corner (in [-0.5, 0.5]^3) and face normal for vertex vi of 36. */
+fn cubeVertex(vi: u32) -> array<vec3f, 2> {
   let face = vi / 6u;
   let corner = vi % 6u;
   var n = vec3f(0.0);
@@ -44,33 +42,62 @@ fn vsParticle(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
     case 5u: { ab = vec2f(-1.0, 1.0); }
     default: {}
   }
-  var local = (n + u * ab.x + w * ab.y) * 0.5;
-  let settled = (p.value & SETTLED) != 0u;
-  let dust = (p.value & DUST) != 0u;
-  var size = 1.0;
-  if (dust) { size = 0.55; }
-  var nrm = n;
-  if (!settled) {
-    let h = hashu(idx * 2654435761u);
-    let axis = normalize(vec3f(f32(h & 255u), f32((h >> 8u) & 255u), f32((h >> 16u) & 255u)) - 127.5);
-    let ang = p.life * (4.0 + f32(h >> 28u));
-    local = rotAxis(local, axis, ang);
-    nrm = rotAxis(n, axis, ang);
-  } else {
-    // Shrink out at the end of a settled particle's life.
-    size *= clamp(p.life * 4.0, 0.0, 1.0);
-  }
-  let worldV = p.pos + local * size;
-  let world = worldV * U.dims.w;
-  out.pos = U.viewProj * vec4f(world, 1.0);
-  let v = p.value & 0xffffu;
+  return array<vec3f, 2>((n + u * ab.x + w * ab.y) * 0.5, n);
+}
+
+fn finish(worldV: vec3f, nrm: vec3f, v: u32, seed: u32) -> PVOut {
+  var out: PVOut;
+  out.pos = C.viewProj * vec4f(worldV * U.dims.w, 1.0);
   let id = v & 0xffu;
-  out.color = debrisColor(v, idx);
+  out.color = debrisColor(v, seed);
   out.normal = nrm;
   out.world = worldV;
   out.emissive = matA(id).w;
   out.glass = matD(id).y;
   return out;
+}
+
+fn hidden() -> PVOut {
+  var out: PVOut;
+  out.pos = vec4f(0.0, 0.0, -2.0, 1.0); // outside the clip volume
+  return out;
+}
+
+@vertex
+fn vsParticle(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> PVOut {
+  let idx = heapR[H_ALIVE + ii];
+  let p = partsR[idx];
+  let cv = cubeVertex(vi);
+  var local = cv[0];
+  var nrm = cv[1];
+  let settled = (p.value & SETTLED) != 0u;
+  var size = select(1.0, 0.55, (p.value & DUST) != 0u);
+  if (!settled) {
+    let h = hashu(idx * 2654435761u);
+    let axis = normalize(vec3f(f32(h & 255u), f32((h >> 8u) & 255u), f32((h >> 16u) & 255u)) - 127.5);
+    let ang = p.life * (4.0 + f32(h >> 28u));
+    local = rotAxis(local, axis, ang);
+    nrm = rotAxis(nrm, axis, ang);
+  } else {
+    // Shrink out at the end of a settled particle's life.
+    size *= clamp(p.life * 4.0, 0.0, 1.0);
+  }
+  return finish(p.pos + local * size, nrm, p.value & 0xffffu, idx);
+}
+
+@vertex
+fn vsChunk(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> PVOut {
+  let key = heapR[H_ARENA + ii * 2u];
+  let vv = heapR[H_ARENA + ii * 2u + 1u];
+  let v = vv & 0xffffu;
+  let chunk = vv >> 16u;
+  let cbase = H_CHUNKS + chunk * 16u;
+  if (v == 0u || heapR[cbase] != 1u) { return hidden(); }
+  let dy = f32(heapR[cbase + 2u]) + bitcast<f32>(heapR[cbase + 3u]);
+  let d = vec3u(U.dims.xyz);
+  let p = vec3f(f32(key % d.x), f32((key / d.x) % d.y), f32(key / (d.x * d.y))) + 0.5 - vec3f(0.0, dy, 0.0);
+  let cv = cubeVertex(vi);
+  return finish(p + cv[0] * 1.002, cv[1], v, key);
 }
 
 @fragment
@@ -83,10 +110,10 @@ fn fsParticle(in: PVOut) -> @location(0) vec4f {
   let vs = U.dims.w;
   var light = mix(vec3f(0.35, 0.25, 0.22), U.ambient.rgb, N.y * 0.5 + 0.5) * 0.8;
   light += U.sunColor.rgb * U.sunDir.w * max(dot(N, U.sunDir.xyz), 0.0) * 0.6;
-  let count = i32(U.sunColor.w);
+  let count = lightCount();
   for (var i = 0; i < count; i++) {
-    let lp = lights[i * 2];
-    let lc = lights[i * 2 + 1];
+    let lp = lightPos(i);
+    let lc = lightCol(i);
     let L = lp.xyz / vs - P;
     let d = length(L);
     let radius = lp.w / vs;
@@ -98,7 +125,7 @@ fn fsParticle(in: PVOut) -> @location(0) vec4f {
   var c = in.color * light;
   if (in.glass > 0.0) {
     // Glass shards: bright speculars that glitter as they tumble.
-    let V = normalize(U.camPos.xyz / vs - P);
+    let V = normalize(C.eye.xyz / vs - P);
     let R = reflect(-V, N);
     c = c * 0.6 + U.sunColor.rgb * pow(max(dot(R, U.sunDir.xyz), 0.0), 40.0) * 3.0 + vec3f(0.08) * pow(1.0 - abs(dot(V, N)), 3.0);
   }

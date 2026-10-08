@@ -19,7 +19,7 @@ export class VoxelWorld {
   readonly bx: number;
   readonly by: number;
   readonly bz: number;
-  readonly grid: Uint32Array<ArrayBuffer>;
+  grid: Uint32Array<ArrayBuffer>;
   pool: Uint16Array<ArrayBuffer>;
   poolCapacity: number;
   poolUsed = 0;
@@ -169,64 +169,21 @@ export class VoxelWorld {
     return Math.round((n / BRICK_VOXELS) * 255);
   }
 
-  /** Voxel-level DDA for gameplay ray casts (in voxel units). */
-  raycast(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, maxDist: number, skipGlass = false): RayHit | null {
-    let x = Math.floor(ox);
-    let y = Math.floor(oy);
-    let z = Math.floor(oz);
-    const sx = dx > 0 ? 1 : -1;
-    const sy = dy > 0 ? 1 : -1;
-    const sz = dz > 0 ? 1 : -1;
-    const idx = Math.abs(1 / (dx || 1e-9));
-    const idy = Math.abs(1 / (dy || 1e-9));
-    const idz = Math.abs(1 / (dz || 1e-9));
-    let tx = (dx > 0 ? x + 1 - ox : ox - x) * idx;
-    let ty = (dy > 0 ? y + 1 - oy : oy - y) * idy;
-    let tz = (dz > 0 ? z + 1 - oz : oz - z) * idz;
-    let t = 0;
-    let nx = 0;
-    let ny = 0;
-    let nz = 0;
-    while (t <= maxDist) {
-      const v = this.get(x, y, z);
-      if (v !== 0 && !(skipGlass && !OPAQUE[v & 0xff])) return { x, y, z, nx, ny, nz, t, v };
-      if (tx < ty && tx < tz) {
-        x += sx;
-        t = tx;
-        tx += idx;
-        nx = -sx;
-        ny = 0;
-        nz = 0;
-      } else if (ty < tz) {
-        y += sy;
-        t = ty;
-        ty += idy;
-        nx = 0;
-        ny = -sy;
-        nz = 0;
-      } else {
-        z += sz;
-        t = tz;
-        tz += idz;
-        nx = 0;
-        ny = 0;
-        nz = -sz;
-      }
-      if (x < -1 || y < -1 || z < -1 || x > this.dx || y > this.dy || z > this.dz) return null;
-    }
-    return null;
+  /** Pool bricks that are allocated but unused (holes left by compaction). */
+  freeBricks(): number[] {
+    return this.freeList.slice();
   }
-}
 
-export interface RayHit {
-  x: number;
-  y: number;
-  z: number;
-  nx: number;
-  ny: number;
-  nz: number;
-  t: number;
-  v: number;
+  /**
+   * Drop the CPU copy once the GPU owns the world: after the upload the
+   * simulation runs entirely on the GPU and nothing reads these arrays.
+   */
+  release(): void {
+    this.pool = new Uint16Array(0);
+    this.grid = new Uint32Array(0);
+    this.dirtyBricks.clear();
+    this.dirtyCells.clear();
+  }
 }
 
 /** OPAQUE[materialId] = 1 unless the material is see-through. Filled lazily by initOpaqueTable(). */

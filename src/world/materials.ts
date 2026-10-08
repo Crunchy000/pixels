@@ -181,15 +181,24 @@ export const M = {
   chipPurple: define('chipPurple', { color: 0x5b1f8a, color2: 0xf4f0e6, noise: 0.03, spec: 0.3, price: 1000 }),
 } as const;
 
-/** Pack the table for the GPU: 16 floats per material, index = material id. */
+/** Floats per material in the GPU table (5 x vec4, see MAT_STRIDE in shared.wgsl). */
+export const MAT_FLOATS = 20;
+
+/**
+ * Pack the table for the GPU, index = material id:
+ *   A = (colour, emission)  B = (colour 2, pattern)  C = (scale, noise, spec, shininess)
+ *   D = (reflect, glass, liquid, price)  E = (softness, fragile 0/1/2, structural, debris)
+ */
 export function packMaterials(): Float32Array<ArrayBuffer> {
-  const out = new Float32Array(256 * 16);
+  const out = new Float32Array(256 * MAT_FLOATS);
   for (const m of materials) {
-    const o = m.id * 16;
+    const o = m.id * MAT_FLOATS;
     const a = srgbHexToLinear(m.color);
     const b = srgbHexToLinear(m.color2);
+    const fragile = m.fragile === 'pane' ? 2 : m.fragile === 'shatter' ? 1 : 0;
     out.set([a[0], a[1], a[2], m.emission, b[0], b[1], b[2], m.pattern], o);
-    out.set([m.scale, m.noise, m.spec, m.shininess, m.reflect, m.glass, m.liquid ? 1 : 0, 0], o + 8);
+    out.set([m.scale, m.noise, m.spec, m.shininess, m.reflect, m.glass, m.liquid ? 1 : 0, m.price], o + 8);
+    out.set([m.softness, fragile, m.structural ? 1 : 0, m.debris], o + 16);
   }
   return out;
 }

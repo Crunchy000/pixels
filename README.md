@@ -12,6 +12,10 @@ hole in the sofa and the foam shows through. Debris settles back into the world
 as real voxels, lamps go dark when their bulbs break, and the damage bill keeps
 running.
 
+Everything after the initial upload (carving, glass shattering, finding
+unsupported pieces, falling chunks, debris, lights, the player) runs in GPU
+compute shaders, with no per-frame CPU↔GPU copies of voxel data.
+
 ```
 npm install
 npm run dev          # http://localhost:5173
@@ -55,38 +59,24 @@ Touch: left thumb moves, right thumb looks, on-screen FIRE / TOOL / JUMP.
 
 ## How it works
 
+The simulation lives entirely on the GPU. The CPU builds the scene once,
+uploads it once, frees its copy, and from then on only sends input (a 208-byte
+uniform block per frame) and reads back a few hundred bytes of HUD counters.
+No voxel data crosses the bus while you play.
+
 ```
-CPU (authoritative)                         GPU
-───────────────────                         ───
-SDF scene ──rasterise──▶ VoxelWorld ──dirty bricks──▶ grid / pool / super-grid buffers
-                          │  ▲                            │
-         shoot ─▶ carve ──┘  │ deposits (readback)        ├─▶ ray-march pass (fragment) ─┐
-                 islands ─▶ falling chunks                 │                              ├─▶ bloom ─▶ tonemap
-                 debris ─────────────────▶ particle buffer ├─▶ particle sim (compute)     │
-                                                           └─▶ particle cubes (indirect) ─┘
+CPU (once)                 GPU, every frame (src/render/shaders/sim.wgsl, player.wgsl)
+──────────                 ────────────────────────────────────────────────────────────
+SDF scene ─rasterise─▶ upload ─▶ grid / pool / super-grid  ◀─┐
+                                   │                          │ edits
+input (208 B/frame) ─▶ player ─▶ camera ─▶ shoot ─▶ impacts ─▶ carve ─▶ glass flood ─┤
+                                   │                                    island search ─┤
+                                   │                       falling chunks ◀────────────┘
+                                   │                       debris particles ─▶ deposits ─┘
+                                   ├─▶ ray-march (fragment) ─┐
+                                   └─▶ debris + chunk cubes ─┴─▶ bloom ─▶ tonemap
+HUD ◀─ ~560 B of counters (bill, voxels smashed, bricks, chunks)
 ```
-
-### Storage: a sparse brick map
-
-`src/world/VoxelWorld.ts`. The world is a grid of 8³-voxel **bricks**. Each
-grid cell is one `u32`:
-
-- `0`: empty brick (all air)
-- `0x80000000 | value`: **uniform** brick, all 512 voxels identical (floor slab, wall core, sofa stuffing)
-- `n`: pool brick `n-1`, holding 512 explicit `u16` voxels
-
-A voxel is a `u16`: low byte is a **material id**, high byte is a "shade" for painted
-detail (chip stripes, card backs, piano keys). Colour is *not* stored per voxel.
-The shader evaluates each material's pattern (marble veins, wood rings, casino
-carpet, wallpaper stripes, animated slot reels) from the voxel's world position,
-so a 3D solid texture stays consistent when you blast into it, and big
-homogeneous regions compress to uniform bricks.
-
-Above the bricks is a **super grid** (4³ bricks = 32³ voxels) holding a count
-of non-empty bricks per region, so rays skip open air 32 voxels at a time.
-
-The CPU keeps the authoritative copy and uploads only dirty bricks/cells each
-frame (`Renderer.syncWorld`), coalescing contiguous ranges.
 
 ### Rendering
 
@@ -125,33 +115,42 @@ a poker table with chip stacks and cards, four slot machines, a grand piano
 with its lid propped, a five-tier champagne tower, neon VEGAS / BAR / martini
 signs, a TV wall, Ming vases on pedestals, a gold trophy, abstract art and palms.
 
-### Destruction
+### Destruction (all compute shaders)
 
-`src/sim/Destruction.ts`:
+`src/render/shaders/sim.wgsl`, orchestrated by `src/gpu/Simulation.ts` as one
+compute pass of about 100 dispatches per frame. Most are indirect, sized by
+counters that earlier dispatches wrote, so idle stages cost almost nothing and
+nothing waits on the CPU. Work queues, the free list, hash tables and chunk
+tables all live in one GPU "heap" buffer (`src/gpu/layout.ts`).
 
-1. **Ray cast** on the CPU copy finds the hit voxel.
-2. **Carve** a jittered sphere. Material softness scales the radius (gold and
-   window frames resist, foam gives), with a minimum so rods and legs can
-   always be shot through. Carving walks bricks and skips empty ones.
-3. **Fragile materials**: `shatter` (bottles, crystal, porcelain) break within
-   a larger radius; `pane` (windows, glass shelves, the table top, mirrors)
-   flood-fill and shatter the whole connected pane.
-4. **Island detection**: solid neighbours of the hole seed a down-first DFS.
-   A component that reaches something structural (floor, walls, ceiling,
-   window frames) is supported. One that doesn't becomes a **falling chunk**.
-   Tiny fragments just crumble into debris.
-5. **Falling chunks** translate down through the grid (no rotation) with
-   gravity. On landing they break fragile things underneath (chandelier into
-   glass table), shatter if they're fragile themselves, and wake up anything
-   floating they landed on.
-6. **Debris** particles are simulated on the GPU (gravity, drag, voxel-DDA
-   collision, bounce). When they come to rest, many are appended to a deposit
-   queue that the CPU reads back and writes into the world as real voxels, so
-   rubble piles up and can be shot again.
+1. **Shoot**: the CPU only says "fire tool X this frame". A compute thread per
+   pellet ray-casts from the GPU-side camera and queues an **impact**.
+2. **Carve**: one workgroup per (impact, brick). Compressed uniform bricks get a
+   real pool brick first (request → allocate → fill). Voxels are removed with
+   atomic compare-exchange, so overlapping blasts are safe. Material softness
+   scales the jittered radius (gold resists, foam gives), with a minimum so rods
+   and legs can always be cut. Removed voxels pay the bill and spawn debris.
+3. **Glass panes** (windows, shelves, the table top, mirrors) shatter by a
+   breadth-first flood through the pane's material, a dozen rings per frame,
+   so the crack visibly spreads from the impact.
+4. **Island search**: voxels next to fresh damage seed a multi-source BFS that
+   runs over a few frames. Every visited voxel goes into a GPU hash table whose
+   slots double as nodes of a lock-free union-find. Components that touch
+   anything structural (floor, walls, ceiling, window frames) are anchored and
+   stop expanding; the rest are lifted out of the world as **falling chunks**
+   (crumbs under 48 voxels just become debris).
+5. **Falling chunks** are drawn as voxel cubes while they fall, so they can't
+   collide with themselves. On landing they smash fragile things underneath
+   (chandelier into glass table), shatter if they are fragile themselves, and
+   otherwise write their voxels back into the world.
+6. **Debris** particles: gravity, drag, voxel-DDA collision and bounce. When
+   they come to rest many are written straight back into the world as voxels,
+   so rubble piles up and can be shot again.
+7. **Player**: walking with voxel collision (or flying) runs in a one-thread
+   compute pass that also builds the camera matrices.
 
-Lights (`src/sim/LightSystem.ts`) are tied to their emissive voxels: break the
-bulbs and the light fades out (flickering while damaged). If a light's fixture
-falls, the light falls with it.
+Lights are tied to their emissive voxels: break the bulbs and the light fades
+out (flickering while damaged). If a fixture falls, its light falls with it.
 
 ## Voxel size vs. memory
 
@@ -168,9 +167,12 @@ area, roughly with the square of `vpm`:
 | 100 | 1.0 cm | 1600×448×1200 | 75 k | 73 MB | 3.3 s |
 | 128 | 7.8 mm | 2048×568×1536 | 175 k | 170 MB | 5.6 s |
 
-\*Per copy (CPU and GPU each hold one), before destruction. Measured headless,
-so build times are only indicative. Explosions expand uniform bricks into pool
-bricks, so memory grows as you smash.
+\*GPU memory before destruction (the CPU copy is freed after the upload).
+Measured headless, so build times are only indicative. The GPU pool reserves
+headroom for destruction: explosions expand uniform bricks into pool bricks,
+and settling rubble adds more. At the default 80 voxels/m the GPU holds about
+195 MB in total: a 141 MB brick pool (2-3x the scene), a 45 MB simulation heap
+(queues, hash table, chunk arena) and 8 MB of debris particles.
 
 ## Status and next steps
 
@@ -182,6 +184,6 @@ Ideas for where to take it:
 
 - Rigid-body chunks that tumble (render chunks as separate voxel volumes with transforms)
 - Temporal accumulation / TAA for soft shadows and multi-bounce light
-- Move carving and island detection to a Web Worker (dynamite costs ~170 ms on the test machine)
+- Build the scene on the GPU too (SDF primitives as data), skipping the one-time upload
 - Brick streaming / LOD for larger worlds and sub-centimetre voxels
 - Sound, fire and liquids

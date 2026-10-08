@@ -1,33 +1,21 @@
-// Shared bindings + voxel access + material colours.
-
-struct Uniforms {
-  invViewProj: mat4x4f,
-  viewProj: mat4x4f,
-  camPos: vec4f,     // xyz metres, w = time (s)
-  dims: vec4f,       // voxel dims xyz, w = voxel size (m)
-  sunDir: vec4f,     // xyz = direction to sun, w = intensity
-  sunColor: vec4f,   // rgb, w = light count
-  ambient: vec4f,    // rgb sky ambient, w = coarse AO strength
-  resolution: vec4f, // w, h, 1/w, 1/h
-  flags: vec4f,      // x reflections, y point-light shadows, z exposure, w frame
-  sim: vec4f,        // x dt, y gravity (voxels/s^2), z particle capacity, w night factor
-};
+// Render-side bindings, voxel reads and procedural material colours.
+// (Prepended with shared.wgsl.)
 
 @group(0) @binding(0) var<uniform> U: Uniforms;
 @group(0) @binding(1) var<storage, read> grid: array<u32>;
 @group(0) @binding(2) var<storage, read> pool: array<u32>;
 @group(0) @binding(3) var<storage, read> mats: array<vec4f>;
+/** lights[0].x = count; light i occupies lights[1 + 2i] (pos, radius) and lights[2 + 2i] (colour, shadow). */
 @group(0) @binding(4) var<storage, read> lights: array<vec4f>;
 @group(0) @binding(5) var densityTex: texture_3d<f32>;
 @group(0) @binding(6) var linSamp: sampler;
 /** Per 4x4x4-brick region: number of non-empty bricks (0 = skip 32^3 voxels at once). */
 @group(0) @binding(7) var<storage, read> superGrid: array<u32>;
+@group(0) @binding(8) var<uniform> C: Camera;
 
-const UNIFORM_BIT: u32 = 0x80000000u;
-
-fn idims() -> vec3i { return vec3i(U.dims.xyz); }
-fn bdims() -> vec3i { return idims() >> vec3u(3u); }
-fn sdims() -> vec3i { return (bdims() + 3) >> vec3u(2u); }
+fn lightCount() -> i32 { return i32(lights[0].x); }
+fn lightPos(i: i32) -> vec4f { return lights[1 + i * 2]; }
+fn lightCol(i: i32) -> vec4f { return lights[2 + i * 2]; }
 
 fn cellEntry(b: vec3i) -> u32 {
   let bd = bdims();
@@ -49,61 +37,10 @@ fn voxelAt(p: vec3i) -> u32 {
   return brickVoxel(g, p & vec3i(7));
 }
 
-fn matA(id: u32) -> vec4f { return mats[id * 4u]; }
-fn matB(id: u32) -> vec4f { return mats[id * 4u + 1u]; }
-fn matC(id: u32) -> vec4f { return mats[id * 4u + 2u]; }
-fn matD(id: u32) -> vec4f { return mats[id * 4u + 3u]; }
-
-fn isGlass(id: u32) -> bool { return matD(id).y > 0.0; }
-
 fn opaqueAt(p: vec3i) -> f32 {
   let v = voxelAt(p);
   if (v == 0u || isGlass(v & 0xffu)) { return 0.0; }
   return 1.0;
-}
-
-// ---------------------------------------------------------------------------
-// Hashing / noise
-
-fn hashu(x: u32) -> u32 {
-  var h = x;
-  h ^= h >> 16u; h *= 0x7feb352du;
-  h ^= h >> 15u; h *= 0x846ca68bu;
-  h ^= h >> 16u;
-  return h;
-}
-fn hash3i(p: vec3i) -> u32 {
-  return hashu((u32(p.x) * 0x9E3779B1u) ^ hashu((u32(p.y) * 0x85EBCA77u) ^ hashu(u32(p.z) * 0xC2B2AE3Du)));
-}
-fn hashf(p: vec3i) -> f32 { return f32(hash3i(p) & 0xffffffu) / 16777215.0; }
-fn hash1f(x: f32) -> f32 { return f32(hashu(u32(i32(floor(x)) + 100000)) & 0xffffu) / 65535.0; }
-fn hash2f(x: f32, y: f32) -> f32 {
-  return f32(hashu((u32(i32(floor(x)) + 100000) * 0x27d4eb2du) ^ hashu(u32(i32(floor(y)) + 7777))) & 0xffffu) / 65535.0;
-}
-
-fn vnoise(p: vec3f) -> f32 {
-  let i = vec3i(floor(p));
-  let f = fract(p);
-  let u = f * f * (3.0 - 2.0 * f);
-  let a = hashf(i);
-  let b = hashf(i + vec3i(1, 0, 0));
-  let c = hashf(i + vec3i(0, 1, 0));
-  let d = hashf(i + vec3i(1, 1, 0));
-  let e = hashf(i + vec3i(0, 0, 1));
-  let f1 = hashf(i + vec3i(1, 0, 1));
-  let g = hashf(i + vec3i(0, 1, 1));
-  let h = hashf(i + vec3i(1, 1, 1));
-  return mix(mix(mix(a, b, u.x), mix(c, d, u.x), u.y), mix(mix(e, f1, u.x), mix(g, h, u.x), u.y), u.z);
-}
-
-fn fbm(p: vec3f) -> f32 {
-  return vnoise(p) * 0.5 + vnoise(p * 2.03 + 17.0) * 0.3 + vnoise(p * 4.1 + 41.0) * 0.2;
-}
-
-fn hsv(h: f32, s: f32, v: f32) -> vec3f {
-  let k = vec3f(1.0, 2.0 / 3.0, 1.0 / 3.0);
-  let p = abs(fract(vec3f(h) + k) * 6.0 - 3.0);
-  return v * mix(vec3f(1.0), clamp(p - 1.0, vec3f(0.0), vec3f(1.0)), s);
 }
 
 // ---------------------------------------------------------------------------
@@ -182,15 +119,15 @@ fn materialColor(v: u32, vp: vec3i) -> vec3f {
       case 11u: {
         let row = floor(wp.y / s);
         let col = floor((wp.x + wp.z) / s);
-        let spin = floor(U.camPos.w * 6.0 + col * 1.7);
+        let spin = floor(U.time.x * 6.0 + col * 1.7);
         let sym = hash2f(row + spin, col);
-        c = hsv(fract(sym * 3.7 + U.camPos.w * 0.05), 0.85, 0.6 + 0.4 * sym);
+        c = hsv(fract(sym * 3.7 + U.time.x * 0.05), 0.85, 0.6 + 0.4 * sym);
         let edge = fract(wp.y / s);
         if (edge < 0.08) { c *= 0.15; }
       }
       case 12u: {
-        let t = fract(wp.y / s + U.camPos.w * 0.03);
-        let wave = 0.5 + 0.5 * sin((wp.x + wp.z) * 3.0 + U.camPos.w * 1.5 + wp.y * 5.0);
+        let t = fract(wp.y / s + U.time.x * 0.03);
+        let wave = 0.5 + 0.5 * sin((wp.x + wp.z) * 3.0 + U.time.x * 1.5 + wp.y * 5.0);
         c = mix(A, B, t * 0.6 + wave * 0.4);
         if ((vp.y & 3) == 0) { c *= 0.75; }
       }
