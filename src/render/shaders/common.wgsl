@@ -20,11 +20,14 @@ struct Uniforms {
 @group(0) @binding(4) var<storage, read> lights: array<vec4f>;
 @group(0) @binding(5) var densityTex: texture_3d<f32>;
 @group(0) @binding(6) var linSamp: sampler;
+/** Per 4x4x4-brick region: number of non-empty bricks (0 = skip 32^3 voxels at once). */
+@group(0) @binding(7) var<storage, read> superGrid: array<u32>;
 
 const UNIFORM_BIT: u32 = 0x80000000u;
 
 fn idims() -> vec3i { return vec3i(U.dims.xyz); }
 fn bdims() -> vec3i { return idims() >> vec3u(3u); }
+fn sdims() -> vec3i { return (bdims() + 3) >> vec3u(2u); }
 
 fn cellEntry(b: vec3i) -> u32 {
   let bd = bdims();

@@ -58,6 +58,12 @@ export class Renderer {
   private lightData = new Float32Array(MAX_LIGHTS * 8);
   private densityTex!: GPUTexture;
   private density: Uint8Array<ArrayBuffer>;
+  /** Non-empty brick count per 4x4x4-brick super cell (lets rays skip 32^3 voxels). */
+  private superBuf!: GPUBuffer;
+  private superData: Uint32Array<ArrayBuffer>;
+  private sx: number;
+  private sy: number;
+  private sz: number;
   private linearSampler!: GPUSampler;
   private nearestSampler!: GPUSampler;
 
@@ -104,6 +110,26 @@ export class Renderer {
     this.canvas = canvas;
     this.world = world;
     this.density = new Uint8Array(world.grid.length);
+    this.sx = Math.ceil(world.bx / 4);
+    this.sy = Math.ceil(world.by / 4);
+    this.sz = Math.ceil(world.bz / 4);
+    this.superData = new Uint32Array(this.sx * this.sy * this.sz);
+  }
+
+  private superIndexOfCell(ci: number): number {
+    const w = this.world;
+    const x = ci % w.bx, y = Math.floor(ci / w.bx) % w.by, z = Math.floor(ci / (w.bx * w.by));
+    return (x >> 2) + this.sx * ((y >> 2) + this.sy * (z >> 2));
+  }
+
+  private recountSuper(si: number): void {
+    const w = this.world;
+    const x0 = (si % this.sx) * 4, y0 = (Math.floor(si / this.sx) % this.sy) * 4, z0 = Math.floor(si / (this.sx * this.sy)) * 4;
+    let n = 0;
+    for (let z = z0; z < Math.min(z0 + 4, w.bz); z++)
+      for (let y = y0; y < Math.min(y0 + 4, w.by); y++)
+        for (let x = x0; x < Math.min(x0 + 4, w.bx); x++) if (w.grid[w.cellIndex(x, y, z)] !== 0) n++;
+    this.superData[si] = n;
   }
 
   async init(): Promise<void> {
@@ -147,6 +173,7 @@ export class Renderer {
     this.matBuf = d.createBuffer({ size: mats.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     d.queue.writeBuffer(this.matBuf, 0, mats);
     this.lightBuf = d.createBuffer({ size: this.lightData.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+    this.superBuf = d.createBuffer({ size: this.superData.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
     this.densityTex = d.createTexture({
       size: [w.bx, w.by, w.bz],
       dimension: '3d',
@@ -157,15 +184,19 @@ export class Renderer {
     this.nearestSampler = d.createSampler({ magFilter: 'nearest', minFilter: 'nearest', addressModeU: 'clamp-to-edge', addressModeV: 'clamp-to-edge' });
 
     const all = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT | GPUShaderStage.COMPUTE;
+    const gfx = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
     this.group0Layout = d.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: all, buffer: { type: 'uniform' } },
         { binding: 1, visibility: all, buffer: { type: 'read-only-storage' } },
         { binding: 2, visibility: all, buffer: { type: 'read-only-storage' } },
         { binding: 3, visibility: all, buffer: { type: 'read-only-storage' } },
-        { binding: 4, visibility: all, buffer: { type: 'read-only-storage' } },
+        // Lights + super grid are render-only: keeps the compute stage within the
+        // default limit of 8 storage buffers.
+        { binding: 4, visibility: gfx, buffer: { type: 'read-only-storage' } },
         { binding: 5, visibility: all, texture: { sampleType: 'float', viewDimension: '3d' } },
         { binding: 6, visibility: all, sampler: { type: 'filtering' } },
+        { binding: 7, visibility: gfx, buffer: { type: 'read-only-storage' } },
       ],
     });
 
@@ -266,6 +297,7 @@ export class Renderer {
         { binding: 4, resource: { buffer: this.lightBuf } },
         { binding: 5, resource: this.densityTex.createView() },
         { binding: 6, resource: this.linearSampler },
+        { binding: 7, resource: { buffer: this.superBuf } },
       ],
     });
   }
@@ -295,6 +327,8 @@ export class Renderer {
       q.writeBuffer(this.gridBuf, 0, w.grid);
       for (let i = 0; i < w.grid.length; i++) this.density[i] = w.cellDensity(i);
       q.writeTexture({ texture: this.densityTex }, this.density, { bytesPerRow: w.bx, rowsPerImage: w.by }, [w.bx, w.by, w.bz]);
+      for (let si = 0; si < this.superData.length; si++) this.recountSuper(si);
+      q.writeBuffer(this.superBuf, 0, this.superData);
       w.dirtyCells.clear();
       w.dirtyBricks.clear();
       this.rebuildGroup0();
@@ -317,6 +351,10 @@ export class Renderer {
         { offset: x0 + w.bx * (y0 + w.by * z0), bytesPerRow: w.bx, rowsPerImage: w.by },
         [x1 - x0 + 1, y1 - y0 + 1, z1 - z0 + 1],
       );
+      const supers = new Set<number>();
+      for (const ci of cells) supers.add(this.superIndexOfCell(ci));
+      for (const si of supers) this.recountSuper(si);
+      q.writeBuffer(this.superBuf, 0, this.superData);
       w.dirtyCells.clear();
     }
     if (w.dirtyBricks.size) {

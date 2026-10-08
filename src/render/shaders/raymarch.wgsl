@@ -13,7 +13,11 @@ struct Hit {
   glow: vec3f,  // light added by glass surfaces (fresnel / glints)
 };
 
-const MAX_OUTER: i32 = 640;
+const MAX_OUTER: i32 = 256;
+
+// Debug counters (step heatmap).
+var<private> gOuterSteps: u32 = 0u;
+var<private> gInnerSteps: u32 = 0u;
 
 fn safeDir(d: vec3f) -> vec3f {
   return select(d, sign(d + vec3f(1e-30)) * 1e-6, abs(d) < vec3f(1e-6));
@@ -64,69 +68,95 @@ fn march(ro: vec3f, rdIn: vec3f, maxT: f32, shadow: bool) -> Hit {
     else { normal = vec3f(0.0, 0.0, -stpF.z); }
   }
 
+  // Three nested DDAs: super cells (32^3 voxels) -> bricks (8^3) -> voxels.
   let bd = bdims();
+  let sd = sdims();
   let p0 = ro + rd * (t + 1e-3);
-  var bc = clamp(vec3i(floor(p0 / 8.0)), vec3i(0), bd - 1);
+  var sc = clamp(vec3i(floor(p0 / 32.0)), vec3i(0), sd - 1);
+  let tDeltaS = abs(inv) * 32.0;
+  var tMaxS = ((vec3f(sc) + pos) * 32.0 - ro) * inv;
   let tDeltaB = abs(inv) * 8.0;
-  var tMaxB = ((vec3f(bc) + pos) * 8.0 - ro) * inv;
   let tDeltaV = abs(inv);
   var inGlass = false;
   var glassId = 0u;
 
   for (var i = 0; i < MAX_OUTER; i++) {
-    let g = grid[u32(bc.x + bd.x * (bc.y + bd.y * bc.z))];
-    if (g != 0u) {
-      let lo = bc * 8;
-      let q = ro + rd * (t + 1e-3);
-      var vc = clamp(vec3i(floor(q)), lo, lo + 7);
-      // Fast path: uniform opaque brick => hit at entry.
-      if ((g & UNIFORM_BIT) != 0u && !isGlass(g & 0xffu)) {
-        h.hit = true; h.t = t; h.voxel = vc; h.normal = normal; h.value = g & 0xffffu;
-        return h;
-      }
-      var tMaxV = (vec3f(vc) + pos - ro) * inv;
-      var tv = t;
-      var n = normal;
-      for (var k = 0; k < 25; k++) {
-        let v = brickVoxel(g, vc - lo);
-        if (v != 0u) {
-          let id = v & 0xffu;
-          if (isGlass(id)) {
-            if (!inGlass || id != glassId) { glassSurface(&h, id, n, rd, shadow); }
-            inGlass = true;
-            glassId = id;
-            if (max(h.trans.x, max(h.trans.y, h.trans.z)) < 0.02) {
-              h.hit = true; h.t = tv; h.voxel = vc; h.normal = n; h.value = v;
-              return h;
-            }
-          } else {
-            h.hit = true; h.t = tv; h.voxel = vc; h.normal = n; h.value = v;
+    gOuterSteps += 1u;
+    if (superGrid[u32(sc.x + sd.x * (sc.y + sd.y * sc.z))] != 0u) {
+      let sLo = sc * 4;
+      let sHi = min(sLo + 3, bd - 1);
+      var bc = clamp(vec3i(floor((ro + rd * (t + 1e-3)) / 8.0)), sLo, sHi);
+      var tMaxB = ((vec3f(bc) + pos) * 8.0 - ro) * inv;
+      var tb = t;
+      var nb = normal;
+      for (var j = 0; j < 14; j++) {
+        gOuterSteps += 1u;
+        let g = grid[u32(bc.x + bd.x * (bc.y + bd.y * bc.z))];
+        if (g != 0u) {
+          let lo = bc * 8;
+          var vc = clamp(vec3i(floor(ro + rd * (tb + 1e-3))), lo, lo + 7);
+          // Fast path: uniform opaque brick => hit at entry.
+          if ((g & UNIFORM_BIT) != 0u && !isGlass(g & 0xffu)) {
+            h.hit = true; h.t = tb; h.voxel = vc; h.normal = nb; h.value = g & 0xffffu;
             return h;
+          }
+          var tMaxV = (vec3f(vc) + pos - ro) * inv;
+          var tv = tb;
+          var n = nb;
+          for (var k = 0; k < 25; k++) {
+            gInnerSteps += 1u;
+            let v = brickVoxel(g, vc - lo);
+            if (v != 0u) {
+              let id = v & 0xffu;
+              if (isGlass(id)) {
+                if (!inGlass || id != glassId) { glassSurface(&h, id, n, rd, shadow); }
+                inGlass = true;
+                glassId = id;
+                if (max(h.trans.x, max(h.trans.y, h.trans.z)) < 0.02) {
+                  h.hit = true; h.t = tv; h.voxel = vc; h.normal = n; h.value = v;
+                  return h;
+                }
+              } else {
+                h.hit = true; h.t = tv; h.voxel = vc; h.normal = n; h.value = v;
+                return h;
+              }
+            } else {
+              inGlass = false;
+            }
+            if (tMaxV.x < tMaxV.y && tMaxV.x < tMaxV.z) {
+              tv = tMaxV.x; vc.x += stp.x; tMaxV.x += tDeltaV.x; n = vec3f(-stpF.x, 0.0, 0.0);
+            } else if (tMaxV.y < tMaxV.z) {
+              tv = tMaxV.y; vc.y += stp.y; tMaxV.y += tDeltaV.y; n = vec3f(0.0, -stpF.y, 0.0);
+            } else {
+              tv = tMaxV.z; vc.z += stp.z; tMaxV.z += tDeltaV.z; n = vec3f(0.0, 0.0, -stpF.z);
+            }
+            if (tv > tExit) { return h; }
+            if (any(vc < lo) || any(vc > lo + 7)) { break; }
           }
         } else {
           inGlass = false;
         }
-        if (tMaxV.x < tMaxV.y && tMaxV.x < tMaxV.z) {
-          tv = tMaxV.x; vc.x += stp.x; tMaxV.x += tDeltaV.x; n = vec3f(-stpF.x, 0.0, 0.0);
-        } else if (tMaxV.y < tMaxV.z) {
-          tv = tMaxV.y; vc.y += stp.y; tMaxV.y += tDeltaV.y; n = vec3f(0.0, -stpF.y, 0.0);
+        if (tMaxB.x < tMaxB.y && tMaxB.x < tMaxB.z) {
+          tb = tMaxB.x; bc.x += stp.x; tMaxB.x += tDeltaB.x; nb = vec3f(-stpF.x, 0.0, 0.0);
+        } else if (tMaxB.y < tMaxB.z) {
+          tb = tMaxB.y; bc.y += stp.y; tMaxB.y += tDeltaB.y; nb = vec3f(0.0, -stpF.y, 0.0);
         } else {
-          tv = tMaxV.z; vc.z += stp.z; tMaxV.z += tDeltaV.z; n = vec3f(0.0, 0.0, -stpF.z);
+          tb = tMaxB.z; bc.z += stp.z; tMaxB.z += tDeltaB.z; nb = vec3f(0.0, 0.0, -stpF.z);
         }
-        if (tv > tExit) { return h; }
-        if (any(vc < lo) || any(vc > lo + 7)) { break; }
+        if (tb > tExit) { return h; }
+        if (any(bc < sLo) || any(bc > sHi)) { break; }
       }
     } else {
       inGlass = false;
     }
-    if (tMaxB.x < tMaxB.y && tMaxB.x < tMaxB.z) {
-      t = tMaxB.x; bc.x += stp.x; tMaxB.x += tDeltaB.x; normal = vec3f(-stpF.x, 0.0, 0.0);
-    } else if (tMaxB.y < tMaxB.z) {
-      t = tMaxB.y; bc.y += stp.y; tMaxB.y += tDeltaB.y; normal = vec3f(0.0, -stpF.y, 0.0);
+    if (tMaxS.x < tMaxS.y && tMaxS.x < tMaxS.z) {
+      t = tMaxS.x; sc.x += stp.x; tMaxS.x += tDeltaS.x; normal = vec3f(-stpF.x, 0.0, 0.0);
+    } else if (tMaxS.y < tMaxS.z) {
+      t = tMaxS.y; sc.y += stp.y; tMaxS.y += tDeltaS.y; normal = vec3f(0.0, -stpF.y, 0.0);
     } else {
-      t = tMaxB.z; bc.z += stp.z; tMaxB.z += tDeltaB.z; normal = vec3f(0.0, 0.0, -stpF.z);
+      t = tMaxS.z; sc.z += stp.z; tMaxS.z += tDeltaS.z; normal = vec3f(0.0, 0.0, -stpF.z);
     }
-    if (t > tExit || any(bc < vec3i(0)) || any(bc >= bd)) { break; }
+    if (t > tExit || any(sc < vec3i(0)) || any(sc >= sd)) { break; }
   }
   return h;
 }
@@ -375,6 +405,11 @@ fn fsMain(in: VSOut) -> FSOut {
       if (dbg == 3) { c = vec3f(fract(h.t / 100.0)); }
       if (dbg == 4) { c = vec3f(f32(h.value & 0xffu) / 64.0, fract(f32(h.value & 0xffu) * 0.37), 0.5); }
       if (dbg == 5) { c = shade(h, ro, rd, 0); }
+      if (dbg == 8 || dbg == 9) {
+        if (dbg == 9) { let P = ro + rd * h.t; let s2 = shade(h, ro, rd, 1); c = s2 * 0.0; }
+        let o = f32(gOuterSteps); let n = f32(gInnerSteps);
+        c = vec3f(o / 300.0, n / 300.0, 0.0);
+      }
       if (dbg == 6) { let P = ro + rd * h.t; c = vec3f(coarseAO(P, h.normal) * fineAO(h.voxel, h.normal, P)); }
       if (dbg == 7) {
         let P = ro + rd * h.t;
